@@ -1,0 +1,40 @@
+[project]
+name = "checkers"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ipython>=9.14.1",
+    "numpy>=2.4.6",
+    "py-draughts>=1.8.3",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.2",
+    "setuptools<81",
+    "structlog>=26.1.0",
+    "tensorboard>=2.20.0",
+    "tqdm>=4.68.3",
+    "types-tqdm>=4.68.0.20260608",
+]
+
+[tool.ruff.lint]
+select = ["I", "F401"]
+
+[tool.mypy]
+explicit_package_bases = true
+exclude = [".venv"]
+follow_imports = "silent"
+cache_dir = ".mypy_cache"
+
+[tool.pyright]
+exclude = [".venv"]
+
+
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+    "mypy>=2.1.0",
+    "pre-commit>=4.6.0",
+    "pyright>=1.1.410",
+    "ruff>=0.15.18",
+]
