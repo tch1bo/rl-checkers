@@ -7,10 +7,9 @@ from typing import Type
 import numpy as np
 import torch
 import tqdm
-from draughts import AlphaBetaEngine, BaseBoard, Benchmark, BenchmarkStats, Color
+from draughts import AlphaBetaEngine, BaseBoard, Benchmark, BenchmarkStats
 from draughts import Move as DraughtsMove
 from pydantic import BaseModel, Field, PrivateAttr
-from torch import Tensor
 from torch.nn.functional import mse_loss
 from torch.utils.tensorboard import SummaryWriter
 
@@ -33,7 +32,7 @@ class TrainArgs(BaseModel):
         default=1000,
         description="only start training when the replay buffer has that many samples",
     )
-    games_per_gradient_step: int = Field(ge=1, default=1)
+    env_steps_per_gradient_step: int = Field(ge=1, default=10)
     max_replay_buffer: int = Field(ge=0, default=100_000)
     eps_min: float = Field(ge=0, le=1.0, default=0.1)
     eps_decay_ratio: float = Field(
@@ -42,7 +41,7 @@ class TrainArgs(BaseModel):
         default=0.3,
         description="eps will be decayed from 1.0 to its min over this ratio of epochs",
     )
-    num_gradient_updates: int = Field(ge=0, default=100000)
+    num_steps: int = Field(ge=0, default=100000)
     train_batch_size: int = Field(ge=0, default=1000)
 
     inference_batch_size: int = Field(ge=0, default=1000)
@@ -73,20 +72,6 @@ class TrainArgs(BaseModel):
         return self._rng
 
 
-class Move(BaseModel):
-    pre_fen: str
-    post_fen: str
-    action_uci: str
-
-    # `reward` is:
-    #   1 - if the move was the last move of the winning side
-    #  -1 - if the move was the last move of the losing side
-    #   0 - otherwise
-    reward: int
-    is_final: bool
-    color: Color
-
-
 def eps_greedy_move(
     args: TrainArgs, eps: float, qnet: MLPQNet, board: BaseBoard
 ) -> DraughtsMove:
@@ -99,45 +84,105 @@ def eps_greedy_move(
     return moves[args.rng.integers(len(moves))]
 
 
+class ReplayBuffer:
+    def __init__(self, max_capacity: int, board_class: Type[BaseBoard]) -> None:
+        # TODO(chibo): research pinned memory
+
+        # The enconding of the pre and post states (4 channels, SQUARES_COUNT)
+        self.pre_input = torch.empty(
+            (max_capacity, 4, board_class.SQUARES_COUNT), dtype=torch.float32
+        )
+        self.post_input = torch.empty(
+            (max_capacity, 4, board_class.SQUARES_COUNT), dtype=torch.float32
+        )
+
+        # The index of the move that was performed from the pre state
+        self.move_index = torch.empty(max_capacity, dtype=torch.int32)
+
+        # The mask for moves available from the post state (SQUARES_COUNT**2)
+        self.post_action_mask = torch.empty(
+            (max_capacity, board_class.SQUARES_COUNT**2), dtype=torch.bool
+        )
+
+        # `reward` is:
+        #   1 - if the move was the last move of the winning side
+        #  -1 - if the move was the last move of the losing side
+        #   0 - otherwise
+        self.reward = torch.empty(max_capacity, dtype=torch.int32)
+
+        # `is_final` is True iff there were no more moves for this player after this move
+        self.is_final = torch.empty(max_capacity, dtype=torch.bool)
+
+        self.head = -1
+        self.max_capacity = max_capacity
+        self.is_full = False
+
+    def append(self) -> int:
+        self.head = self.head + 1
+        if self.head == self.max_capacity:
+            self.head = 0
+            self.is_full = True
+        return self.head
+
+    def sample(self, rng: np.random.Generator, num_samples: int) -> np.ndarray:
+        if self.is_full:
+            indices = np.arange(self.max_capacity)
+        else:
+            indices = np.arange(self.head)
+        return rng.choice(indices, num_samples)
+
+
 def play_one_game(
     args: TrainArgs,
     qnet: MLPQNet,
     board_class: Type[BaseBoard],
-    replay_buffer: list[Move],
+    replay_buffer: ReplayBuffer,
     eps: float,
-) -> None:
+) -> int:
     board = board_class()
-    fens: list[str] = [board.fen]
-    ucis: list[str] = []
-    while not board.game_over:
-        move = eps_greedy_move(args, eps, qnet, board)
-        board.push(move)
-        fens.append(board.fen)
-        ucis.append(str(move))
+    indices: list[int] = []
+    qnet.eval()
 
-    # Transforms the fens and ucis into `Moves`
-    moves: list[Move] = []
-    for i, uci in enumerate(ucis):
-        moves.append(
-            Move(
-                pre_fen=fens[i],
-                post_fen=fens[min(i + 2, len(fens) - 1)],
-                action_uci=uci,
-                reward=0,
-                # Only the last two moves are final
-                is_final=board.game_over and i >= len(ucis) - 2,
-                color=Color.BLACK if i % 2 else Color.WHITE,
+    while not board.game_over and len(indices) < args.max_moves_per_game:
+        index = replay_buffer.append()
+        indices.append(index)
+        state = board.to_tensor()
+
+        # Store the pre_input
+        replay_buffer.pre_input[index].copy_(torch.from_numpy(state))
+
+        # Store the post input and the post mask for the previous move from the same player
+        if len(indices) > 2:
+            prev_move_index = indices[-3]
+            replay_buffer.post_input[prev_move_index].copy_(torch.from_numpy(state))
+            board.legal_moves
+            replay_buffer.post_action_mask[prev_move_index].copy_(
+                torch.from_numpy(board.legal_moves_mask())
             )
-        )
+
+        # Store the reward and the is_final.
+        # These are 0/false for all moves except the last two, which we'll handle separately
+        replay_buffer.reward[index] = 0
+        replay_buffer.is_final[index] = False
+
+        # Choose the move and store it
+        with torch.no_grad():
+            move = eps_greedy_move(args, eps, qnet, board)
+        replay_buffer.move_index[index] = board.move_to_index(move)
+        board.push(move)
+
+    # Handle the last two moves. We don't bother updating the `post_input` / `post_action_mask`,
+    # because they will be ignored during the training loop (because `is_final == True`).
+    replay_buffer.is_final[indices[-1]] = True
+    replay_buffer.is_final[indices[-2]] = True
+
     if board.game_over and not board.is_draw:
-        # The last move of the losing side
-        moves[-2].reward = -1
-        # The last move of the winning side
-        moves[-1].reward = 1
-    replay_buffer.extend(moves)
+        # The last player to make a move won
+        replay_buffer.reward[indices[-1]] = 1
+        # The other player lost
+        replay_buffer.reward[indices[-2]] = -1
 
-
-FenAndColor = tuple[str, Color]
+    return len(indices)
 
 
 def optimize(
@@ -145,91 +190,86 @@ def optimize(
     online_model: MLPQNet,
     target_model: MLPQNet,
     optimizer: torch.optim.Optimizer,
-    board_class: Type[BaseBoard],
-    replay_buffer: list[Move],
+    replay_buffer: ReplayBuffer,
+    num_batches: int,
 ) -> float:
-    indices = args.rng.choice(np.arange(len(replay_buffer)), args.train_batch_size)
-    batch = [replay_buffer[idx] for idx in indices]
+    all_indices = replay_buffer.sample(args.rng, num_batches * args.train_batch_size)
 
     # Compute the bootstrap term `max Q(S', a)`
     target_model.eval()
     with torch.no_grad():
-        post_inputs = torch.empty((len(batch), 4, board_class.SQUARES_COUNT))
-        mask = torch.empty((len(batch), board_class.SQUARES_COUNT**2), dtype=torch.bool)
-        for i, move in enumerate(batch):
-            board = board_class.from_fen(move.post_fen)
-            post_inputs[i] = Tensor(board.to_tensor(perspective=move.color))
-            mask[i] = Tensor(board.legal_moves_mask())
-
-        post_inputs = post_inputs.to(device=target_model.device)
-        mask = mask.to(device=target_model.device)
-
-        values = target_model.forward(post_inputs)
-        values.masked_fill_(~mask, float("-inf"))
-        max_values = values.amax(dim=1)
-
-        is_final_move = torch.tensor(
-            [move.is_final for move in batch],
-            dtype=torch.bool,
-            device=target_model.device,
+        post_input = replay_buffer.post_input[all_indices].to(
+            device=target_model.device
         )
-        max_values.masked_fill_(is_final_move, 0.0)
-        rewards = torch.tensor(
-            [move.reward for move in batch], device=online_model.device
+        mask = replay_buffer.post_action_mask[all_indices].to(
+            device=target_model.device
+        )
+        is_final = replay_buffer.is_final[all_indices].to(device=target_model.device)
+        reward = replay_buffer.reward[all_indices].to(device=target_model.device)
+
+        # This computes `max Q(S', a)` for all non-final moves. For the final move, the result is 0
+        max_values = (
+            target_model.forward(post_input)
+            .masked_fill(~mask, float("-inf"))
+            .amax(dim=1)
+            .masked_fill(is_final, 0.0)
         )
 
-        targets = args.gamma * max_values + rewards
+        targets = args.gamma * max_values + reward
 
     # Do batched SGD
     online_model.train()
-    pre_inputs = torch.empty((len(batch), 4, board_class.SQUARES_COUNT))
-    move_indices = torch.zeros(len(batch), dtype=torch.int)
-    for j, move in enumerate(batch):
-        board = board_class.from_fen(move.pre_fen)
-        pre_inputs[j] = Tensor(board.to_tensor(perspective=move.color))
-        m = DraughtsMove.from_uci(move.action_uci, board.legal_moves)
-        move_indices[j] = board.move_to_index(m)
+    losses: list[float] = []
+    for batch_start in range(0, len(all_indices), args.train_batch_size):
+        batch_indices = all_indices[batch_start : batch_start + args.train_batch_size]
+        batch_targets = targets[batch_start : batch_start + args.train_batch_size]
 
-    pre_inputs = pre_inputs.to(online_model.device)
-    move_indices = move_indices.to(online_model.device)
+        pre_input = replay_buffer.pre_input[batch_indices].to(online_model.device)
+        move_index = replay_buffer.move_index[batch_indices].to(online_model.device)
 
-    y = online_model.forward(pre_inputs)
-    predictions = y[torch.arange(y.size(0), device=online_model.device), move_indices]
-    loss = mse_loss(predictions, targets)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    return loss.item()
+        y = online_model.forward(pre_input)
+        y = y[torch.arange(y.size(0), device=online_model.device), move_index]
+        loss = mse_loss(y, batch_targets)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        losses.append(loss.item())
+
+    return sum(losses) / len(losses)
 
 
 def benchmark_against_ab_engine(
     qnet: MLPQNet, board_class: Type[BaseBoard]
 ) -> dict[int, BenchmarkStats]:
-    qnet = deepcopy(qnet).to("cpu")
-    result = {
-        level: Benchmark(
-            qnet.as_engine(),
-            AlphaBetaEngine(depth_limit=level),
-            board_class=board_class,
-            games=10,
-            workers=10,
-        ).run()
-        for level in range(2, 8)
-    }
+    qnet.eval()
+    with torch.no_grad():
+        result = {
+            level: Benchmark(
+                qnet.as_engine(),
+                AlphaBetaEngine(depth_limit=level),
+                board_class=board_class,
+                games=10,
+                workers=10,
+            ).run()
+            for level in range(2, 8)
+        }
     return result
 
 
 def benchmark_against_random(
     qnet: MLPQNet, board_class: Type[BaseBoard]
 ) -> BenchmarkStats:
-    qnet = deepcopy(qnet).to("cpu")
-    return Benchmark(
-        qnet.as_engine(),
-        RandomEngine(),
-        board_class=board_class,
-        games=10,
-        workers=10,
-    ).run()
+    qnet.eval()
+    with torch.no_grad():
+        return Benchmark(
+            qnet.as_engine(),
+            RandomEngine(),
+            board_class=board_class,
+            games=10,
+            workers=10,
+        ).run()
 
 
 def train(args: TrainArgs) -> None:
@@ -247,37 +287,35 @@ def train(args: TrainArgs) -> None:
     target_model = deepcopy(online_model)
 
     # Fill up the replay buffer with moves played by random policies
-    replay_buffer: list[Move] = []
-    while len(replay_buffer) < args.min_replay_buffer:
+    replay_buffer = ReplayBuffer(args.max_replay_buffer, board_class)
+    while replay_buffer.head < args.min_replay_buffer:
         play_one_game(args, online_model, board_class, replay_buffer, 1.0)
 
     # Do the "play -> gradient update" steps
-    eps_decay_steps = max(int(args.eps_decay_ratio * args.num_gradient_updates), 1)
+    eps_decay_steps = max(int(args.eps_decay_ratio * args.num_steps), 1)
     optimizer = torch.optim.RMSprop(online_model.parameters(), lr=args.learning_rate)
     loss_sum: float = 0
     start_time = time.perf_counter()
-    for step in tqdm.trange(args.num_gradient_updates):
+    num_gradient_updates = 0
+    for step in tqdm.trange(args.num_steps):
         eps = max(args.eps_min, 1.0 - step / eps_decay_steps)
 
-        # Play games
-        for _ in range(args.games_per_gradient_step):
-            play_one_game(args, online_model, board_class, replay_buffer, eps)
-
-        # Clean the storage of the replay buffer if it gets too big
-        if len(replay_buffer) > 10 * args.max_replay_buffer:
-            replay_buffer = replay_buffer[-args.max_replay_buffer :]
+        # Play one game
+        num_new_moves = play_one_game(
+            args, online_model, board_class, replay_buffer, eps
+        )
 
         # Do a gradient step
-        loss = optimize(
-            args,
-            online_model,
-            target_model,
-            optimizer,
-            board_class,
-            replay_buffer[-args.max_replay_buffer :],
-        )
-        loss_sum += loss
-        tb_writer.add_scalar("loss", loss, step)
+        if num_new_moves > 0:
+            num_batches = num_new_moves // args.env_steps_per_gradient_step
+            loss = optimize(
+                args, online_model, target_model, optimizer, replay_buffer, num_batches
+            )
+            loss_sum += loss
+            tb_writer.add_scalar("loss", loss, step)
+
+            num_gradient_updates += num_batches
+            tb_writer.add_scalar("num_gradient_updates", num_gradient_updates, step)
 
         if step % args.sync_every == 0:
             # sync online_model -> target_model
@@ -291,23 +329,25 @@ def train(args: TrainArgs) -> None:
                 elapsed=f"{elapsed:.4f}s",
                 elapsed_per_step=f"{elapsed/args.steps_in_epoch:.4f}s",
                 eps=f"{eps:.3f}",
+                num_gradient_updates=num_gradient_updates,
             )
             loss_sum = 0.0
 
             # Benchmark against an alpha-beta engine
             logger.info("running benchmarks against AB and random engines")
-            vs_ab = benchmark_against_ab_engine(online_model, board_class)
+            cpu_online_model = deepcopy(online_model).to("cpu")
+            vs_ab = benchmark_against_ab_engine(cpu_online_model, board_class)
             for level, stats in vs_ab.items():
                 tb_writer.add_scalar(f"win-rate-ab-{level}", stats.e1_win_rate, step)
                 tb_writer.add_scalar(f"game-len-ab-{level}", stats.avg_moves, step)
 
             # Benchmark against a random engine
-            vs_random = benchmark_against_random(online_model, board_class)
+            vs_random = benchmark_against_random(cpu_online_model, board_class)
             tb_writer.add_scalar(f"win-rate-random", vs_random.e1_win_rate, step)
             tb_writer.add_scalar(f"game-len-random", vs_random.avg_moves, step)
             tb_writer.flush()
 
             out_path = args.out_dir / f"checkpoint_{step}.pt"
             logger.info("saved checkpoint", out_path=out_path)
-            torch.save(online_model.state_dict(), out_path)
+            torch.save(cpu_online_model.state_dict(), out_path)
             start_time = time.perf_counter()

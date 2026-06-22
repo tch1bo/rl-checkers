@@ -56,7 +56,7 @@ class MLPQNet(nn.Module, BaseAgent):
     def select_move(self, board: BaseBoard) -> Move:
         self.eval()
 
-        input = Tensor(board.to_tensor()).unsqueeze(0)
+        input = torch.from_numpy(board.to_tensor()).unsqueeze(0)
         predictions = self.forward(input).reshape(-1).to("cpu")
         predictions[~board.legal_moves_mask()] = float("-inf")
         move_index = predictions.argmax().item()
