@@ -131,6 +131,15 @@ class ReplayBuffer:
             indices = np.arange(self.head)
         return rng.choice(indices, num_samples)
 
+    def get_samples_for_q_val_validation(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        non_final_mask = ~self.is_final[: self.head]
+        return (
+            self.post_input[: self.head][non_final_mask].to(device),
+            self.post_action_mask[: self.head][non_final_mask].to(device),
+        )
+
 
 def play_one_game(
     args: TrainArgs,
@@ -272,6 +281,14 @@ def benchmark_against_random(
         ).run()
 
 
+def get_mean_max_q_values(
+    qnet: MLPQNet, inputs: torch.Tensor, mask: torch.Tensor
+) -> float:
+    return (
+        qnet.forward(inputs).masked_fill(~mask, float("-inf")).amax(dim=1).mean().item()
+    )
+
+
 def train(args: TrainArgs) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "args.json").write_text(args.model_dump_json(indent=2))
@@ -290,6 +307,11 @@ def train(args: TrainArgs) -> None:
     replay_buffer = ReplayBuffer(args.max_replay_buffer, board_class)
     while replay_buffer.head < args.min_replay_buffer:
         play_one_game(args, online_model, board_class, replay_buffer, 1.0)
+    qval_validation_input, qval_validation_mask = (
+        replay_buffer.get_samples_for_q_val_validation(online_model.device)
+    )
+
+    logger.info(f"using {len(qval_validation_input)} states for Q-value validation")
 
     # Do the "play -> gradient update" steps
     eps_decay_steps = max(int(args.eps_decay_ratio * args.num_steps), 1)
@@ -316,6 +338,11 @@ def train(args: TrainArgs) -> None:
 
             num_gradient_updates += num_batches
             tb_writer.add_scalar("num_gradient_updates", num_gradient_updates, step)
+
+            mean_max_q = get_mean_max_q_values(
+                online_model, qval_validation_input, qval_validation_mask
+            )
+            tb_writer.add_scalar("mean_max_q", mean_max_q, step)
 
         if step % args.sync_every == 0:
             # sync online_model -> target_model
