@@ -3,7 +3,7 @@ from typing import Any, Literal, Type, assert_never
 
 from draughts import Engine
 
-from lib.mlp import MLPQNet
+from lib.models import MLPQNet
 
 EngineIdT = Literal["random", "alpha-beta"] | Path
 BoardClassLiteral = Literal["russian", "standard"]

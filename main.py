@@ -2,8 +2,8 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, CliApp, CliSubCommand
 
 from lib.benchmark import BenchmarkArgs
+from lib.dqn import TrainArgs as DQNTrainArgs
 from lib.play import PlayArgs
-from lib.trainer import TrainArgs
 
 
 class DebugArgs(BaseModel):
@@ -12,7 +12,7 @@ class DebugArgs(BaseModel):
 
 
 class CliArgs(BaseSettings):
-    train: CliSubCommand[TrainArgs]
+    train_dqn: CliSubCommand[DQNTrainArgs]
     benchmark: CliSubCommand[BenchmarkArgs]
     play: CliSubCommand[PlayArgs]
     debug: CliSubCommand[DebugArgs]

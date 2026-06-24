@@ -14,13 +14,15 @@ from torch.nn.functional import mse_loss
 from torch.utils.tensorboard import SummaryWriter
 
 from lib.log import get_logger
-from lib.mlp import MLPQNet
+from lib.models import MLPQNet
 from lib.utils import DEFAULT_BOARD, BoardClassLiteral, RandomEngine, choose_board_class
 
 logger = get_logger()
 
 
 class TrainArgs(BaseModel):
+    """This trainer implements a modification of the DQN paper"""
+
     board_type: BoardClassLiteral = DEFAULT_BOARD
 
     learning_rate: float = Field(ge=0.0, default=1e-4)
