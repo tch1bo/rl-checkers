@@ -115,8 +115,6 @@ class MLPVNet(nn.Module, BaseAgent):
     def best_move_and_value(self, board: BaseBoard) -> tuple[Move, float]:
         self.eval()
 
-        # TODO(chibo): read about pinned memory and non_blocking
-        # https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html
         tensors = []
         moves = board.legal_moves
         for move in moves:

@@ -13,13 +13,14 @@ from torch.nn.functional import mse_loss
 from torch.utils.tensorboard import SummaryWriter
 
 from lib.log import get_logger
-from lib.models import NUM_CHANNELS, MLPVNet
+from lib.models import MLPVNet
 from lib.utils import (
     DEFAULT_BOARD,
     BoardClassLiteral,
     benchmark_against_ab_engine,
     benchmark_against_random,
     choose_board_class,
+    encode_batch,
 )
 
 logger = get_logger()
@@ -34,7 +35,7 @@ class TrainArgs(BaseModel):
     gamma: float = Field(ge=0.0, le=1.0, default=1.0)
     lam: float = Field(ge=0.0, le=1.0, default=0.75)
 
-    games_per_step: int = Field(lt=1, default=100)
+    games_per_step: int = Field(ge=1, default=100)
     max_moves_per_game: int = Field(ge=0, default=200)
     eps_min: float = Field(ge=0, le=1.0, default=0.1)
     eps_decay_ratio: float = Field(
@@ -73,10 +74,14 @@ def play_games_and_sample_batch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     model.eval()
 
-    states_and_values: list[list[tuple[torch.Tensor, float]]] = [
+    # For each game, an ordered list of its pre-move states, where each state is stored as
+    # `(bitboards, perspective, value)`. The raw bitboards + perspective are kept (instead of
+    # the encoded tensor) so that only the sampled states are encoded, once, at the end.
+    states_and_values: list[list[tuple[tuple[int, int, int, int], int, float]]] = [
         [] for _ in range(args.games_per_step)
     ]
     boards: list[BaseBoard] = [board_class() for _ in range(args.games_per_step)]
+    rng = args.rng
 
     # Play N games using the current policy and record all the states and their values
     for _ in range(args.max_moves_per_game):
@@ -84,15 +89,18 @@ def play_games_and_sample_batch(
         active_game_indices: list[int] = []
 
         # For each game in `active_game_indices` the moves available from the current state
-        # Together with each move, stores the index of the post-move state tensor in `state_tensors`
+        # Together with each move, stores the index of the post-move state in `mask_rows`
         moves_for_game: list[list[tuple[Move, int]]] = []
 
-        # For each game in `active_game_indices` stores the index of the tensor for the current state
-        # of the board
+        # For each game in `active_game_indices` stores the index of the current board state
+        # in `mask_rows`
         pre_state_indices: list[int] = []
 
-        # Stores all the states to evaluate by the model
-        state_tensors: list[torch.Tensor] = []
+        # Raw bitboards `(white_men, white_kings, black_men, black_kings)` and the matching
+        # perspective (board.turn) for every state the model needs to evaluate this iteration.
+        # Encoding is deferred to a single vectorized `encode_batch` call below.
+        mask_rows: list[tuple[int, int, int, int]] = []
+        turn_rows: list[int] = []
 
         # Choose the games that are still going
         for game_idx in range(args.games_per_step):
@@ -101,20 +109,29 @@ def play_games_and_sample_batch(
                 continue
 
             active_game_indices.append(game_idx)
-            pre_state_indices.append(len(state_tensors))
+            pre_state_indices.append(len(mask_rows))
 
             # The pre-state is from the mover's perspective
-            state_tensors.append(torch.from_numpy(board.to_tensor()))
-
-            # TODO(chibo): this doesn't do any exploration :(
+            mask_rows.append(
+                (board.white_men, board.white_kings, board.black_men, board.black_kings)
+            )
+            turn_rows.append(1 if board.turn == Color.WHITE else -1)
 
             moves_for_game.append([])
             for move in board.legal_moves:
                 board.push(move)
 
-                moves_for_game[-1].append((move, len(state_tensors)))
+                moves_for_game[-1].append((move, len(mask_rows)))
                 # The post state is from the opponent's perspective
-                state_tensors.append(torch.from_numpy(board.to_tensor()))
+                mask_rows.append(
+                    (
+                        board.white_men,
+                        board.white_kings,
+                        board.black_men,
+                        board.black_kings,
+                    )
+                )
+                turn_rows.append(1 if board.turn == Color.WHITE else -1)
                 board.pop()
 
         if not active_game_indices:
@@ -125,24 +142,33 @@ def play_games_and_sample_batch(
         num_moves_for_game = [len(moves) for moves in moves_for_game]
 
         # For every game, there should be:
-        #   1. a tensor for the state before any moves
-        #   2. a tensor for the state after each move
-        assert sum(num_moves_for_game) + len(active_game_indices) == len(state_tensors)
+        #   1. a state for the board before any moves
+        #   2. a state for the board after each move
+        assert sum(num_moves_for_game) + len(active_game_indices) == len(mask_rows)
 
-        inputs = torch.stack(state_tensors).to(model.device)
+        encoded = encode_batch(
+            np.asarray(mask_rows, dtype=np.uint64),
+            np.asarray(turn_rows, dtype=np.int8),
+            board_class.SQUARES_COUNT,
+        )
+        inputs = torch.from_numpy(encoded).to(model.device)
         with torch.no_grad():
             values = model.forward(inputs).to("cpu")
 
         for i, game_idx in enumerate(active_game_indices):
-            # Push the pre-state tensor and its value
+            # Record the pre-state bitboards, its perspective and its value
             pre_state_idx = pre_state_indices[i]
             states_and_values[game_idx].append(
-                (state_tensors[pre_state_idx], float(values[pre_state_idx].item()))
+                (
+                    mask_rows[pre_state_idx],
+                    turn_rows[pre_state_idx],
+                    float(values[pre_state_idx].item()),
+                )
             )
 
             # Choose and make the best move
             moves_and_indices = moves_for_game[i]
-            if args.rng.random() > eps:
+            if rng.random() > eps:
                 # Greedy move
                 # Since the post state is from the opponent's perspective, we need to take `min`
                 # (and not `max`) here
@@ -151,7 +177,7 @@ def play_games_and_sample_batch(
                 )
             else:
                 # Exploration move
-                best_move_idx = int(args.rng.integers(len(moves_and_indices)))
+                best_move_idx = int(rng.integers(len(moves_and_indices)))
             boards[game_idx].push(moves_and_indices[best_move_idx][0])
 
     # Determine the winner
@@ -172,14 +198,13 @@ def play_games_and_sample_batch(
     if len(all_move_indices) < args.train_batch_size:
         sampled_indices = all_move_indices
     else:
-        idx = args.rng.choice(
+        idx = rng.choice(
             np.arange(len(all_move_indices)), args.train_batch_size, replace=False
         )
         sampled_indices = [all_move_indices[i] for i in idx]
 
-    sampled_states = torch.empty(
-        (len(sampled_indices), NUM_CHANNELS, board_class.SQUARES_COUNT)
-    )
+    sampled_masks = np.empty((len(sampled_indices), 4), dtype=np.uint64)
+    sampled_turns = np.empty(len(sampled_indices), dtype=np.int8)
     sampled_updates = torch.zeros(len(sampled_indices))
 
     for i, (game_idx, move_idx) in enumerate(sampled_indices):
@@ -193,7 +218,7 @@ def play_games_and_sample_batch(
         sign = -1.0
         for n in range(move_idx + 1, len(svs)):
             gamma *= args.gamma
-            update += sign * lam * gamma * svs[n][1]
+            update += sign * lam * gamma * svs[n][2]
             lam *= args.lam
             sign *= -1
 
@@ -208,7 +233,14 @@ def play_games_and_sample_batch(
             update += reward
 
         sampled_updates[i] = update
-        sampled_states[i] = svs[move_idx][0]
+        masks, perspective, _ = svs[move_idx]
+        sampled_masks[i] = masks
+        sampled_turns[i] = perspective
+
+    # Encode only the sampled states, in a single vectorized pass
+    sampled_states = torch.from_numpy(
+        encode_batch(sampled_masks, sampled_turns, board_class.SQUARES_COUNT)
+    )
 
     return sampled_states, sampled_updates
 

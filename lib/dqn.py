@@ -94,8 +94,6 @@ def eps_greedy_move(
 
 class ReplayBuffer:
     def __init__(self, max_capacity: int, board_class: Type[BaseBoard]) -> None:
-        # TODO(chibo): research pinned memory
-
         # The enconding of the pre and post states (NUM_CHANNELS, SQUARES_COUNT)
         self.pre_input = torch.empty(
             (max_capacity, NUM_CHANNELS, board_class.SQUARES_COUNT), dtype=torch.float32
