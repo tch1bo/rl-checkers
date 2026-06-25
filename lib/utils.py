@@ -1,9 +1,11 @@
 from pathlib import Path
 from typing import Any, Literal, Type, assert_never
 
-from draughts import Engine
+import torch
+from draughts import STANDARD_OPENINGS, AgentEngine, Benchmark, Engine
+from draughts.benchmark import BenchmarkStats
 
-from lib.models import MLPQNet
+from lib.models import MLPVNet
 
 EngineIdT = Literal["random", "alpha-beta"] | Path
 BoardClassLiteral = Literal["russian", "standard"]
@@ -40,8 +42,8 @@ def make_engine(engine_id: EngineIdT, board_type: BoardClassLiteral) -> Engine:
         return RandomEngine()
     assert isinstance(engine_id, Path)
 
-    mlp = MLPQNet.load_from_path(engine_id, choose_board_class(board_type))
-    return mlp.as_engine()
+    # TODO(chibo): decide whether we need QNets at all. If yes, discriminate here.
+    return MLPVNet.load_from_path(engine_id, choose_board_class(board_type)).as_engine()
 
 
 def choose_board_class(b: BoardClassLiteral) -> Type[BaseBoard]:
@@ -51,3 +53,41 @@ def choose_board_class(b: BoardClassLiteral) -> Type[BaseBoard]:
         case "standard":
             return StandardBoard
     assert_never(b)
+
+
+def _num_games(board_class: Type[BaseBoard]) -> int:
+    if board_class.SQUARES_COUNT == 50:
+        return len(STANDARD_OPENINGS) * 2
+    return 2
+
+
+def benchmark_against_ab_engine(
+    engine: AgentEngine, board_class: Type[BaseBoard]
+) -> dict[int, BenchmarkStats]:
+    num_games = _num_games(board_class)
+    with torch.no_grad():
+        result = {
+            level: Benchmark(
+                engine,
+                AlphaBetaEngine(depth_limit=level),
+                board_class=board_class,
+                games=num_games,
+                workers=1 if level < 5 else min(num_games, 10),
+                swap_colors=True,
+            ).run()
+            for level in range(2, 8)
+        }
+    return result
+
+
+def benchmark_against_random(
+    engine: AgentEngine, board_class: Type[BaseBoard]
+) -> BenchmarkStats:
+    with torch.no_grad():
+        return Benchmark(
+            engine,
+            RandomEngine(),
+            board_class=board_class,
+            games=_num_games(board_class),
+            workers=1,
+        ).run()

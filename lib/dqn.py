@@ -7,15 +7,21 @@ from typing import Type
 import numpy as np
 import torch
 import tqdm
-from draughts import AlphaBetaEngine, BaseBoard, Benchmark, BenchmarkStats
+from draughts import BaseBoard
 from draughts import Move as DraughtsMove
 from pydantic import BaseModel, Field, PrivateAttr
 from torch.nn.functional import mse_loss
 from torch.utils.tensorboard import SummaryWriter
 
 from lib.log import get_logger
-from lib.models import MLPQNet
-from lib.utils import DEFAULT_BOARD, BoardClassLiteral, RandomEngine, choose_board_class
+from lib.models import NUM_CHANNELS, MLPQNet
+from lib.utils import (
+    DEFAULT_BOARD,
+    BoardClassLiteral,
+    benchmark_against_ab_engine,
+    benchmark_against_random,
+    choose_board_class,
+)
 
 logger = get_logger()
 
@@ -90,12 +96,12 @@ class ReplayBuffer:
     def __init__(self, max_capacity: int, board_class: Type[BaseBoard]) -> None:
         # TODO(chibo): research pinned memory
 
-        # The enconding of the pre and post states (4 channels, SQUARES_COUNT)
+        # The enconding of the pre and post states (NUM_CHANNELS, SQUARES_COUNT)
         self.pre_input = torch.empty(
-            (max_capacity, 4, board_class.SQUARES_COUNT), dtype=torch.float32
+            (max_capacity, NUM_CHANNELS, board_class.SQUARES_COUNT), dtype=torch.float32
         )
         self.post_input = torch.empty(
-            (max_capacity, 4, board_class.SQUARES_COUNT), dtype=torch.float32
+            (max_capacity, NUM_CHANNELS, board_class.SQUARES_COUNT), dtype=torch.float32
         )
 
         # The index of the move that was performed from the pre state
@@ -251,38 +257,6 @@ def optimize(
     return sum(losses) / len(losses)
 
 
-def benchmark_against_ab_engine(
-    qnet: MLPQNet, board_class: Type[BaseBoard]
-) -> dict[int, BenchmarkStats]:
-    qnet.eval()
-    with torch.no_grad():
-        result = {
-            level: Benchmark(
-                qnet.as_engine(),
-                AlphaBetaEngine(depth_limit=level),
-                board_class=board_class,
-                games=10,
-                workers=10,
-            ).run()
-            for level in range(2, 8)
-        }
-    return result
-
-
-def benchmark_against_random(
-    qnet: MLPQNet, board_class: Type[BaseBoard]
-) -> BenchmarkStats:
-    qnet.eval()
-    with torch.no_grad():
-        return Benchmark(
-            qnet.as_engine(),
-            RandomEngine(),
-            board_class=board_class,
-            games=10,
-            workers=10,
-        ).run()
-
-
 def get_mean_max_q_values(
     qnet: MLPQNet, inputs: torch.Tensor, mask: torch.Tensor
 ) -> float:
@@ -364,14 +338,18 @@ def train(args: TrainArgs) -> None:
 
             # Benchmark against an alpha-beta engine
             logger.info("running benchmarks against AB and random engines")
-            cpu_online_model = deepcopy(online_model).to("cpu")
-            vs_ab = benchmark_against_ab_engine(cpu_online_model, board_class)
+            cpu_online_model = deepcopy(online_model).to("cpu").eval()
+            vs_ab = benchmark_against_ab_engine(
+                cpu_online_model.as_engine(), board_class
+            )
             for level, stats in vs_ab.items():
                 tb_writer.add_scalar(f"win-rate-ab-{level}", stats.e1_win_rate, step)
                 tb_writer.add_scalar(f"game-len-ab-{level}", stats.avg_moves, step)
 
             # Benchmark against a random engine
-            vs_random = benchmark_against_random(cpu_online_model, board_class)
+            vs_random = benchmark_against_random(
+                cpu_online_model.as_engine(), board_class
+            )
             tb_writer.add_scalar(f"win-rate-random", vs_random.e1_win_rate, step)
             tb_writer.add_scalar(f"game-len-random", vs_random.avg_moves, step)
             tb_writer.flush()
