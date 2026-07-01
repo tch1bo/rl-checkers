@@ -4,15 +4,15 @@ from pydantic import BaseModel
 from lib.utils import (
     DEFAULT_BOARD,
     BoardClassLiteral,
-    EngineIdT,
+    EngineIdAndDepth,
     choose_board_class,
     make_engine,
 )
 
 
 class PlayArgs(BaseModel):
-    white: EngineIdT | None = None
-    black: EngineIdT | None = None
+    white: EngineIdAndDepth | None = None
+    black: EngineIdAndDepth | None = None
     board_type: BoardClassLiteral = DEFAULT_BOARD
 
     def cli_cmd(self) -> None:

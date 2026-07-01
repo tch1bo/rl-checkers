@@ -1,26 +1,20 @@
-from draughts import Benchmark
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, CliApp, CliSubCommand
 
+from lib.alpha_beta import AlphaBetaNet
 from lib.benchmark import BenchmarkArgs
 from lib.dqn import TrainArgs as DQNTrainArgs
 from lib.models import MLPVNet
 from lib.offline_lambda import TrainArgs as OfflineLambdaTrainArgs
 from lib.play import PlayArgs
-from lib.utils import DEFAULT_BOARD, RandomEngine, choose_board_class
+from lib.utils import DEFAULT_BOARD, choose_board_class
 
 
 class DebugArgs(BaseModel):
     def cli_cmd(self) -> None:
-        vnet = MLPVNet.init_with_random_weights(choose_board_class(DEFAULT_BOARD))
-        stats = Benchmark(
-            RandomEngine(),
-            vnet.as_engine(),
-            board_class=choose_board_class(DEFAULT_BOARD),
-            games=1,
-            workers=1,
-        ).run()
-        print(stats)
+        board_class = choose_board_class(DEFAULT_BOARD)
+        vnet = AlphaBetaNet(MLPVNet.init_with_random_weights(board_class), depth=2)
+        vnet.best_move_and_value(board_class())
 
 
 class CliArgs(BaseSettings):

@@ -276,8 +276,6 @@ def train(args: TrainArgs) -> None:
         device = torch.device("cuda:0")
     logger.info("starting training", out_dir=args.out_dir, device=device)
 
-    # TODO(chibo): sample the states for validation
-
     model = MLPVNet.init_with_random_weights(board_class, device)
     eps_decay_steps = max(int(args.eps_decay_ratio * args.num_steps), 1)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)

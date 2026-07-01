@@ -5,7 +5,7 @@ from lib.log import get_logger
 from lib.utils import (
     DEFAULT_BOARD,
     BoardClassLiteral,
-    EngineIdT,
+    EngineIdAndDepth,
     choose_board_class,
     make_engine,
 )
@@ -15,8 +15,8 @@ logger = get_logger()
 
 class BenchmarkArgs(BaseModel):
     n_games: int = Field(ge=1, default=10)
-    a: EngineIdT
-    b: EngineIdT = "alpha-beta"
+    a: EngineIdAndDepth
+    b: EngineIdAndDepth = EngineIdAndDepth(engine="alpha-beta")
     board_type: BoardClassLiteral = DEFAULT_BOARD
     n_workers: int = Field(ge=1, default=10)
 
@@ -34,5 +34,6 @@ def benchmark(args: BenchmarkArgs) -> None:
         board_class=choose_board_class(args.board_type),
         games=args.n_games,
         workers=args.n_workers,
+        swap_colors=True,
     ).run()
     print(stats)

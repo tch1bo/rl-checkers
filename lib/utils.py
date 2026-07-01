@@ -1,25 +1,39 @@
 from pathlib import Path
 from typing import Any, Literal, Type, assert_never
 
+import numpy as np
 import torch
-from draughts import STANDARD_OPENINGS, AgentEngine, Benchmark, Engine
+from draughts import (
+    STANDARD_OPENINGS,
+    AgentEngine,
+    AlphaBetaEngine,
+    BaseBoard,
+    Benchmark,
+    Engine,
+    Move,
+    RussianBoard,
+    StandardBoard,
+)
 from draughts.benchmark import BenchmarkStats
+from pydantic import BaseModel, model_validator
 
+from lib.alpha_beta import AlphaBetaNet
 from lib.models import MLPVNet
 
 EngineIdT = Literal["random", "alpha-beta"] | Path
 BoardClassLiteral = Literal["russian", "standard"]
 DEFAULT_BOARD: BoardClassLiteral = "standard"
 
-import numpy as np
-from draughts import (
-    AlphaBetaEngine,
-    BaseBoard,
-    Engine,
-    Move,
-    RussianBoard,
-    StandardBoard,
-)
+
+class EngineIdAndDepth(BaseModel):
+    engine: EngineIdT
+    depth: int = 0
+
+    @model_validator(mode="after")
+    def set_depth_default(self) -> "EngineIdAndDepth":
+        if self.engine == "alpha-beta" and self.depth == 0:
+            self.depth = 6
+        return self
 
 
 class RandomEngine(Engine):
@@ -35,15 +49,20 @@ class RandomEngine(Engine):
         return (move, 1.0) if with_evaluation else move
 
 
-def make_engine(engine_id: EngineIdT, board_type: BoardClassLiteral) -> Engine:
-    if engine_id == "alpha-beta":
-        return AlphaBetaEngine()
-    if engine_id == "random":
+def make_engine(
+    engine_and_depth: EngineIdAndDepth, board_type: BoardClassLiteral
+) -> Engine:
+    engine, depth = engine_and_depth.engine, engine_and_depth.depth
+    if engine == "alpha-beta":
+        return AlphaBetaEngine(depth_limit=depth)
+    if engine == "random":
         return RandomEngine()
-    assert isinstance(engine_id, Path)
+    assert isinstance(engine, Path)
 
-    # TODO(chibo): decide whether we need QNets at all. If yes, discriminate here.
-    return MLPVNet.load_from_path(engine_id, choose_board_class(board_type)).as_engine()
+    net = MLPVNet.load_from_path(engine, choose_board_class(board_type))
+    if depth == 0:
+        return net.as_engine()
+    return AlphaBetaNet(net, depth).as_engine()
 
 
 def choose_board_class(b: BoardClassLiteral) -> Type[BaseBoard]:
